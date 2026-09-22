@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_blue_classic/flutter_blue_classic.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'dart:convert';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -11,7 +11,7 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  final FlutterBlueClassic _bluetooth = FlutterBlueClassic.instance;
+  BluetoothCharacteristic? _char;
   List<Map<String, String>> passwords = [];
   bool connected = false;
   String status = 'Not Connected';
@@ -32,75 +32,82 @@ class _HomePageState extends State<HomePage> {
     setState(() => status = 'Scanning...');
     
     try {
-      List<dynamic> devices = await _bluetooth.getBondedDevices();
+      await FlutterBluePlus.startScan(timeout: Duration(seconds: 10));
       
-      for (var device in devices) {
-        if (device['name'] == 'SecureKey_C3') {
-          setState(() => status = 'Found device! Tap to connect');
-          // Show device, let user tap to connect
-          _showConnectDialog(device);
-          return;
+      FlutterBluePlus.scanResults.listen((results) async {
+        for (var r in results) {
+          if (r.device.name == 'SecureKey_C3') {
+            await FlutterBluePlus.stopScan();
+            await _connectToDevice(r.device);
+            return;
+          }
         }
-      }
+      });
       
-      setState(() => status = 'Device not found. Make sure it\'s paired.');
+      await Future.delayed(Duration(seconds: 10));
+      if (!connected) {
+        setState(() => status = 'Device not found');
+      }
     } catch (e) {
       setState(() => status = 'Error: $e');
     }
   }
 
-  void _showConnectDialog(dynamic device) {
-    showDialog(
-      context: context,
-      builder: (c) => AlertDialog(
-        title: Text('Device Found'),
-        content: Text('Connect to ${device['name']}?'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(c),
-            child: Text('Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              Navigator.pop(c);
-              _connectToDevice(device);
-            },
-            child: Text('Connect'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _connectToDevice(dynamic device) async {
+  Future<void> _connectToDevice(BluetoothDevice device) async {
     try {
       setState(() => status = 'Connecting...');
+      await device.connect();
       
-      await _bluetooth.connect(device['address']);
+      List<BluetoothService> services = await device.discoverServices();
       
-      setState(() {
-        connected = true;
-        status = 'Connected';
-      });
-      
-      // Simulate getting password list
-      // In real implementation, you'd communicate with ESP32 here
-      setState(() {
-        passwords = [
-          {'site': 'example.com', 'user': 'user@example.com'},
-          {'site': 'github.com', 'user': 'myusername'},
-        ];
-      });
-      
+      for (var s in services) {
+        if (s.uuid.toString().toLowerCase().contains('4fafc201')) {
+          for (var c in s.characteristics) {
+            if (c.uuid.toString().toLowerCase().contains('beb5483e')) {
+              _char = c;
+              await c.setNotifyValue(true);
+              
+              c.value.listen((v) {
+                if (v.isNotEmpty) {
+                  var msg = utf8.decode(v);
+                  if (msg.startsWith('LIST|')) parsePasswords(msg.substring(5));
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text(msg), duration: Duration(seconds: 2))
+                  );
+                }
+              });
+              
+              setState(() {
+                connected = true;
+                status = 'Connected';
+              });
+              sendCmd('LIST');
+              return;
+            }
+          }
+        }
+      }
     } catch (e) {
       setState(() => status = 'Connection failed: $e');
     }
   }
 
-  void sendCmd(String cmd) {
-    if (connected) {
-      _bluetooth.write(cmd);
+  void parsePasswords(String data) {
+    var items = data.split(';');
+    List<Map<String, String>> temp = [];
+    for (var item in items) {
+      if (item.trim().isNotEmpty) {
+        var parts = item.split(',');
+        if (parts.length >= 2) {
+          temp.add({'site': parts[0].trim(), 'user': parts[1].trim()});
+        }
+      }
     }
+    setState(() => passwords = temp);
+  }
+
+  void sendCmd(String cmd) {
+    if (_char != null) _char!.write(utf8.encode(cmd));
   }
 
   void addPassword() {
@@ -129,9 +136,6 @@ class _HomePageState extends State<HomePage> {
               if (siteCtrl.text.isNotEmpty && userCtrl.text.isNotEmpty && passCtrl.text.isNotEmpty) {
                 sendCmd('ADD|${siteCtrl.text}|${userCtrl.text}|${passCtrl.text}');
                 Navigator.pop(c);
-                setState(() {
-                  passwords.add({'site': siteCtrl.text, 'user': userCtrl.text});
-                });
               }
             },
             child: Text('Add'),
@@ -200,19 +204,11 @@ class _HomePageState extends State<HomePage> {
                           children: [
                             IconButton(
                               icon: Icon(Icons.login, color: Colors.green),
-                              onPressed: () {
-                                sendCmd('FILL|${passwords[i]['site']}');
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  SnackBar(content: Text('Filling ${passwords[i]['site']}')),
-                                );
-                              },
+                              onPressed: () => sendCmd('FILL|${passwords[i]['site']}'),
                             ),
                             IconButton(
                               icon: Icon(Icons.delete, color: Colors.red),
-                              onPressed: () {
-                                sendCmd('DELETE|${passwords[i]['site']}');
-                                setState(() => passwords.removeAt(i));
-                              },
+                              onPressed: () => sendCmd('DELETE|${passwords[i]['site']}'),
                             ),
                           ],
                         ),
